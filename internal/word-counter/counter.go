@@ -8,7 +8,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
-	"time"
+	"strings"
 
 	"word-counter/pkg/sema"
 )
@@ -62,7 +62,6 @@ func (c *Counter) Count(ctx context.Context, sources []string, word string) ([]R
 			}
 		}(source)
 	}
-	time.Sleep(time.Second)
 
 	records := make([]Record, 0, len(sources))
 
@@ -90,7 +89,7 @@ func (c *Counter) countInSource(ctx context.Context, source string, word string)
 	count := 0
 
 	for _, w := range words {
-		if w == word {
+		if strings.EqualFold(w, word) {
 			count++
 		}
 	}
@@ -100,6 +99,7 @@ func (c *Counter) countInSource(ctx context.Context, source string, word string)
 
 // read reads content from source. Source can be either path to file or web url.
 func (c *Counter) read(ctx context.Context, source string) ([]byte, error) {
+	// os.Stat returns nil error if file exists.
 	_, err := os.Stat(source)
 	if err == nil {
 		return os.ReadFile(source)
@@ -120,6 +120,10 @@ func (c *Counter) read(ctx context.Context, source string) ([]byte, error) {
 		return nil, fmt.Errorf("http get: %w", err)
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("status is not OK (%s)", resp.Status)
+	}
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
