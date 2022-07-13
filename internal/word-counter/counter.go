@@ -9,6 +9,7 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"sync"
 
 	"word-counter/pkg/sema"
 )
@@ -43,39 +44,71 @@ func (c *Counter) Count(ctx context.Context, sources []string, word string) ([]R
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	recordsCh := make(chan Record)
-	errCh := make(chan error)
+	recordsCh, errCh := c.scanSources(ctx, sources, word)
 
-	for _, source := range sources {
-		go func(source string) {
-			c.sema.Acquire()
-			defer c.sema.Release()
-
-			count, err := c.countInSource(ctx, source, word)
-			if err != nil {
-				errCh <- fmt.Errorf("count in source %q: %w", source, err)
-			}
-
-			recordsCh <- Record{
-				Source: source,
-				Count:  count,
-			}
-		}(source)
-	}
-
+	// We don't need a mutex here to protect records
+	// because only one goroutine writes to it and execution flow controlled
+	// by done channel.
 	records := make([]Record, 0, len(sources))
+	done := make(chan struct{})
 
-	for len(records) != len(sources) {
-		select {
-		case record := <-recordsCh:
+	handleRecords := func() {
+		for record := range recordsCh {
 			records = append(records, record)
-		case err := <-errCh:
-			cancel()
-			return nil, err
 		}
+		done <- struct{}{}
 	}
+	go handleRecords()
+
+	// errCh will be closed and ok will be false if no error happened.
+	err, ok := <-errCh
+	if ok {
+		return nil, err
+	}
+
+	<-done
 
 	return records, nil
+}
+
+// scanSources scans sources launching goroutines. Goroutines count controlled by semaphore and configurable
+// parameter operationsCountLimit. It returns channel with records and channel with errors. Both channels will
+// be closed onces all sources will be scanned.
+func (c *Counter) scanSources(ctx context.Context, sources []string, word string) (chan Record, chan error) {
+	records := make(chan Record, 1)
+	errors := make(chan error, 1)
+
+	wg := &sync.WaitGroup{}
+	wg.Add(len(sources))
+
+	go func() {
+		for _, source := range sources {
+			c.sema.Acquire()
+			go func(source string) {
+				defer wg.Done()
+				defer c.sema.Release()
+
+				count, err := c.countInSource(ctx, source, word)
+				if err != nil {
+					errors <- fmt.Errorf("count in source %q: %w", source, err)
+					return
+				}
+
+				records <- Record{
+					Source: source,
+					Count:  count,
+				}
+			}(source)
+		}
+	}()
+
+	go func() {
+		wg.Wait()
+		close(records)
+		close(errors)
+	}()
+
+	return records, errors
 }
 
 // countIsSource returns count of word in source.
